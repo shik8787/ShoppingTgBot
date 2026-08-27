@@ -1,0 +1,1 @@
+"""Shopping checklist Telegram bot."""

@@ -1,0 +1,240 @@
+# ShoppingTgBot
+
+[![Docker Pulls](https://img.shields.io/docker/pulls/shik8787/shopping-tg-bot?logo=docker)](https://hub.docker.com/r/shik8787/shopping-tg-bot)
+![Python](https://img.shields.io/badge/Python-3.12-blue?logo=python)
+![Platforms](https://img.shields.io/badge/platform-linux%2Famd64%20%7C%20linux%2Farm64-lightgrey)
+
+Telegram-бот для совместного планирования покупок. Он хранит отдельный список
+для каждого личного или группового чата, а покупки отмечаются inline-галочками
+прямо в сообщении.
+
+Готовый бот: [`@shoppimg_planning_bot`](https://t.me/shoppimg_planning_bot)
+
+## Как это выглядит
+
+```text
+🛒 Список покупок
+
+1. ⬜ Молоко
+2. ✅ Хлеб
+3. ⬜ Яблоки
+
+Осталось: 2 из 3
+```
+
+Каждая покупка также отображается отдельной кнопкой. Нажатие переключает
+состояние `⬜/✅` и сразу обновляет сообщение.
+
+## Возможности
+
+- общий список покупок для каждого Telegram-чата;
+- inline-галочки без отправки дополнительных команд;
+- добавление через `/add`, обычным текстом или кнопку `➕ Добавить`;
+- импорт готового многострочного списка;
+- удаление всех отмеченных покупок одной кнопкой;
+- защита от дубликатов без учёта регистра, включая кириллицу;
+- постоянное SQLite-хранилище в режиме WAL;
+- необязательный allowlist Telegram chat ID;
+- Docker healthcheck и автоматический перезапуск;
+- read-only root filesystem, лимиты памяти/процессов и ротация логов;
+- готовый multi-arch образ для AMD64 и Raspberry Pi ARM64.
+
+## Быстрый запуск через Docker
+
+1. Создайте Telegram-бота через
+   [`@BotFather`](https://t.me/BotFather) и получите токен.
+2. Скопируйте конфигурацию:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+3. Заполните `TELEGRAM_BOT_TOKEN` в `.env`.
+4. Создайте каталог базы и запустите контейнер:
+
+   ```bash
+   mkdir -p data
+   docker compose pull
+   docker compose up -d
+   ```
+
+5. Проверьте состояние:
+
+   ```bash
+   docker compose ps
+   docker compose logs --tail 100
+   ```
+
+Docker Hub:
+[`shik8787/shopping-tg-bot:latest`](https://hub.docker.com/r/shik8787/shopping-tg-bot)
+
+Поддерживаемые платформы:
+
+- `linux/amd64`;
+- `linux/arm64`.
+
+## Конфигурация
+
+| Переменная | По умолчанию | Назначение |
+|---|---:|---|
+| `TELEGRAM_BOT_TOKEN` | — | Обязательный токен от BotFather |
+| `DATABASE_PATH` | `/data/shopping.db` | Путь к SQLite-базе внутри контейнера |
+| `ALLOWED_CHAT_IDS` | пусто | Разрешённые chat ID через запятую |
+| `MAX_ITEMS_PER_LIST` | `50` | Максимум покупок в одном чате, от 1 до 50 |
+| `PUID` | `1000` | UID пользователя контейнера |
+| `PGID` | `1000` | GID пользователя контейнера |
+| `SHOPPING_IMAGE` | `shik8787/shopping-tg-bot:latest` | Используемый Docker-образ |
+
+Пример:
+
+```env
+TELEGRAM_BOT_TOKEN=token-from-botfather
+DATABASE_PATH=/data/shopping.db
+ALLOWED_CHAT_IDS=123456789,-1001234567890
+MAX_ITEMS_PER_LIST=50
+PUID=1000
+PGID=1000
+SHOPPING_IMAGE=shik8787/shopping-tg-bot:latest
+```
+
+Если `ALLOWED_CHAT_IDS` пустой, бот работает во всех чатах, куда его добавили.
+
+## Использование
+
+| Команда | Действие |
+|---|---|
+| `/start` | Показать справку и текущий список |
+| `/list` | Показать актуальный список |
+| `/add молоко` | Добавить одну покупку |
+| `/add` | Запросить название через Force Reply |
+| `/clear` | Удалить все отмеченные покупки |
+| `/cancel` | Отменить ожидаемое добавление |
+
+В личном чате обычное текстовое сообщение также добавляется как покупка.
+
+### Импорт нескольких покупок
+
+Отправьте сообщение, начинающееся со слов `Список покупок`:
+
+```text
+Список покупок
+- Молоко
+- Хлеб
+- Яблоки
+```
+
+Каждая непустая строка после заголовка станет отдельной покупкой. Допускаются:
+
+```text
+Список покупок:
+1. Молоко
+2) Хлеб
+• Яблоки
+⬜ Сыр
+✅ Кофе
+```
+
+Маркеры, номера и старые значки галочек удаляются автоматически. Новые позиции
+добавляются как неотмеченные.
+
+## Использование в группах
+
+В групповых чатах безопаснее добавлять покупки через `/add` или кнопку
+`➕ Добавить`: бот использует персональный Force Reply и не воспринимает
+обычную переписку как список.
+
+Чтобы бот видел самостоятельные сообщения вида `Список покупок`, отключите
+privacy mode:
+
+1. откройте `@BotFather`;
+2. выберите бота через `/mybots`;
+3. откройте **Bot Settings → Group Privacy**;
+4. нажмите **Turn off**.
+
+## Raspberry Pi
+
+Узнайте UID и GID пользователя:
+
+```bash
+id -u
+id -g
+```
+
+Запишите их в `PUID` и `PGID`, затем запустите обычные Docker-команды:
+
+```bash
+mkdir -p data
+docker compose pull
+docker compose up -d
+```
+
+Конфигурация рассчитана на длительную работу:
+
+- лимит памяти контейнера — 256 MB;
+- лимит процессов — 64;
+- корневая файловая система доступна только для чтения;
+- `/tmp` размещён в RAM;
+- Docker-журналы ограничены тремя файлами по 10 MB;
+- SQLite хранится только в `./data`;
+- контейнер автоматически запускается после перезагрузки.
+
+## Обновление
+
+```bash
+docker compose pull
+docker compose up -d --force-recreate
+docker image prune -f
+```
+
+## Резервная копия
+
+Для согласованной копии SQLite временно остановите контейнер:
+
+```bash
+docker compose stop
+cp data/shopping.db "data/shopping-$(date +%F).db"
+docker compose start
+```
+
+Не добавляйте каталог `data` и файл `.env` в Git.
+
+## Локальная разработка
+
+Требуется Python 3.12+.
+
+### Windows PowerShell
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+python -m app.bot
+```
+
+Для локальной Docker-сборки:
+
+```bash
+docker compose up -d --build
+```
+
+## Структура проекта
+
+```text
+ShoppingTgBot/
+├── app/
+│   ├── bot.py          # Telegram handlers и inline-кнопки
+│   ├── config.py       # Переменные окружения
+│   └── repository.py   # SQLite-хранилище
+├── data/               # Постоянная база, исключена из Git
+├── tests/              # Unit-тесты
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
+
+## Тесты
+
+```bash
+python -m unittest discover -s tests
+```

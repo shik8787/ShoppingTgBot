@@ -1,0 +1,42 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  shopping-tg-bot:
+    image: ${SHOPPING_IMAGE:-shik8787/shopping-tg-bot:latest}
+    build:
+      context: .
+    container_name: shopping-tg-bot
+    restart: unless-stopped
+    init: true
+    user: "${PUID:-1000}:${PGID:-1000}"
+    env_file:
+      - .env
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    mem_limit: 256m
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *default-logging
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,sys,time; p='/tmp/shopping-heartbeat'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p)<60 else 1)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    volumes:
+      - ./data:/data
