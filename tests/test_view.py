@@ -19,6 +19,24 @@ class ShoppingListViewTest(unittest.TestCase):
         self.assertEqual("toggle:10", keyboard.inline_keyboard[0][0].callback_data)
         self.assertEqual("toggle:11", keyboard.inline_keyboard[1][0].callback_data)
 
+    def test_current_list_actions_are_scoped_to_list(self):
+        items = [
+            ShoppingItem(10, 100, "Молоко", False, list_id=7),
+        ]
+
+        _, keyboard = build_list_view(items, list_id=7)
+
+        callbacks = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("toggle:7:10", callbacks)
+        self.assertIn("edit:7", callbacks)
+        self.assertIn("add:7", callbacks)
+        self.assertIn("refresh:7", callbacks)
+        self.assertIn("remove_checked:7", callbacks)
+
     def test_renders_empty_list_actions(self):
         text, keyboard = build_list_view([])
 
@@ -48,6 +66,18 @@ class ShoppingListViewTest(unittest.TestCase):
             parse_shopping_list_message("Покажи список покупок\nМолоко")
         )
         self.assertEqual([], parse_shopping_list_message("СПИСОК ПОКУПОК"))
+
+    def test_repeated_header_is_not_an_item(self):
+        self.assertEqual(
+            ["Молоко", "Хлеб"],
+            parse_shopping_list_message(
+                "Список покупок:\n"
+                "- Список покупок\n"
+                "- Молоко\n"
+                "- СПИСОК ПОКУПОК:\n"
+                "- Хлеб"
+            ),
+        )
 
 
 if __name__ == "__main__":

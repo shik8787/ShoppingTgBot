@@ -30,6 +30,7 @@ from app.repository import (
     ListLimitReachedError,
     ShoppingItem,
     ShoppingRepository,
+    normalize_item_name,
 )
 
 
@@ -43,8 +44,13 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_PATH = Path("/tmp/shopping-heartbeat")
 ADD_PROMPT_KEY = "shopping_add_prompt"
+EDIT_PROMPT_KEY = "shopping_edit_prompt"
 SHOPPING_LIST_HEADER = re.compile(
     r"^\s*список\s+покупок\s*:?\s*(?:\r?\n|$)",
+    re.IGNORECASE,
+)
+SHOPPING_LIST_HEADER_LINE = re.compile(
+    r"^\s*список\s+покупок\s*:?\s*$",
     re.IGNORECASE,
 )
 LIST_ITEM_PREFIX = re.compile(
@@ -54,6 +60,7 @@ LIST_ITEM_PREFIX = re.compile(
 
 def build_list_view(
     items: list[ShoppingItem],
+    list_id: int | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     remaining = sum(not item.is_checked for item in items)
     lines = ["🛒 Список покупок", ""]
@@ -69,25 +76,47 @@ def build_list_view(
         [
             InlineKeyboardButton(
                 f"{'✅' if item.is_checked else '⬜'} {_button_name(item.name)}",
-                callback_data=f"toggle:{item.id}",
+                callback_data=(
+                    f"toggle:{list_id}:{item.id}"
+                    if list_id is not None
+                    else f"toggle:{item.id}"
+                ),
             )
         ]
         for item in items
     ]
-    keyboard.extend(
-        [
+    if list_id is None:
+        keyboard.append(
             [
                 InlineKeyboardButton("➕ Добавить", callback_data="add"),
                 InlineKeyboardButton("🔄 Обновить", callback_data="refresh"),
-            ],
+            ]
+        )
+    else:
+        keyboard.extend(
             [
-                InlineKeyboardButton(
-                    "🧹 Удалить купленное",
-                    callback_data="remove_checked",
-                )
-            ],
-        ]
-    )
+                [
+                    InlineKeyboardButton(
+                        "✏️ Редактировать",
+                        callback_data=f"edit:{list_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "➕ Добавить",
+                        callback_data=f"add:{list_id}",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔄 Обновить",
+                        callback_data=f"refresh:{list_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "🧹 Удалить купленное",
+                        callback_data=f"remove_checked:{list_id}",
+                    ),
+                ],
+            ]
+        )
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
 
@@ -149,6 +178,7 @@ async def cancel_command(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     context.user_data.pop(ADD_PROMPT_KEY, None)
+    context.user_data.pop(EDIT_PROMPT_KEY, None)
     if _is_allowed(update, context):
         await update.effective_message.reply_text("Добавление отменено.")
 
@@ -161,6 +191,19 @@ async def text_message(
         return
 
     message = update.effective_message
+    edit_prompt = context.user_data.get(EDIT_PROMPT_KEY)
+    is_edit_reply = _is_prompt_reply(update, edit_prompt)
+    if is_edit_reply:
+        context.user_data.pop(EDIT_PROMPT_KEY, None)
+        await _replace_shopping_list(
+            update,
+            context,
+            edit_prompt["list_id"],
+            edit_prompt["list_message_id"],
+            message.text,
+        )
+        return
+
     shopping_list = parse_shopping_list_message(message.text)
     if shopping_list is not None:
         context.user_data.pop(ADD_PROMPT_KEY, None)
@@ -168,15 +211,16 @@ async def text_message(
         return
 
     prompt = context.user_data.get(ADD_PROMPT_KEY)
-    is_prompt_reply = (
-        prompt is not None
-        and prompt["chat_id"] == update.effective_chat.id
-        and message.reply_to_message is not None
-        and message.reply_to_message.message_id == prompt["message_id"]
-    )
+    is_prompt_reply = _is_prompt_reply(update, prompt)
     if is_prompt_reply:
         context.user_data.pop(ADD_PROMPT_KEY, None)
-        await _add_item(update, context, message.text)
+        await _add_item(
+            update,
+            context,
+            message.text,
+            prompt.get("list_id"),
+            prompt.get("list_message_id"),
+        )
         return
 
     if update.effective_chat.type == ChatType.PRIVATE:
@@ -200,20 +244,32 @@ async def callback_query(
 
     if data.startswith("toggle:"):
         try:
-            item_id = int(data.removeprefix("toggle:"))
+            callback_ids = [
+                int(value)
+                for value in data.removeprefix("toggle:").split(":")
+            ]
         except ValueError:
             await query.answer("Некорректная покупка.", show_alert=True)
             return
-        item = await repository.toggle_item(chat_id, item_id)
+        if len(callback_ids) == 1:
+            list_id, item_id = None, callback_ids[0]
+        elif len(callback_ids) == 2:
+            list_id, item_id = callback_ids
+        else:
+            await query.answer("Некорректная покупка.", show_alert=True)
+            return
+        item = await repository.toggle_item(chat_id, item_id, list_id)
         if item is None:
             await query.answer("Покупка уже удалена.", show_alert=True)
-            await _edit_list(query, repository, chat_id)
+            await _edit_list(query, repository, chat_id, list_id)
             return
         await query.answer("Куплено" if item.is_checked else "Вернул в список")
-        await _edit_list(query, repository, chat_id)
+        await _edit_list(query, repository, chat_id, item.list_id)
         return
 
-    if data == "add":
+    action, list_id = _parse_list_action(data)
+
+    if action == "add":
         await query.answer()
         user = query.from_user
         prompt = await query.message.reply_text(
@@ -227,18 +283,40 @@ async def callback_query(
         context.user_data[ADD_PROMPT_KEY] = {
             "chat_id": chat_id,
             "message_id": prompt.message_id,
+            "list_id": list_id,
+            "list_message_id": query.message.message_id,
         }
         return
 
-    if data == "remove_checked":
-        removed = await repository.remove_checked(chat_id)
-        await query.answer(f"Удалено: {removed}")
-        await _edit_list(query, repository, chat_id)
+    if action == "edit" and list_id is not None:
+        await query.answer()
+        user = query.from_user
+        prompt = await query.message.reply_text(
+            f"{user.mention_html()}, отправьте новый состав этого списка, "
+            "каждую покупку с новой строки.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(
+                selective=True,
+                input_field_placeholder="Например: молоко, хлеб, яблоки",
+            ),
+        )
+        context.user_data[EDIT_PROMPT_KEY] = {
+            "chat_id": chat_id,
+            "message_id": prompt.message_id,
+            "list_id": list_id,
+            "list_message_id": query.message.message_id,
+        }
         return
 
-    if data == "refresh":
+    if action == "remove_checked":
+        removed = await repository.remove_checked(chat_id, list_id)
+        await query.answer(f"Удалено: {removed}")
+        await _edit_list(query, repository, chat_id, list_id)
+        return
+
+    if action == "refresh":
         await query.answer("Список обновлён")
-        await _edit_list(query, repository, chat_id)
+        await _edit_list(query, repository, chat_id, list_id)
         return
 
     await query.answer("Неизвестное действие.", show_alert=True)
@@ -277,10 +355,13 @@ async def post_shutdown(application: Application) -> None:
 async def _send_list(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    list_id: int | None = None,
 ) -> None:
     repository = _repository(context)
-    items = await repository.list_items(update.effective_chat.id)
-    text, keyboard = build_list_view(items)
+    if list_id is None:
+        list_id = await repository.latest_list_id(update.effective_chat.id)
+    items = await repository.list_items(update.effective_chat.id, list_id)
+    text, keyboard = build_list_view(items, list_id)
     await update.effective_message.reply_text(text, reply_markup=keyboard)
 
 
@@ -288,9 +369,12 @@ async def _edit_list(
     query,
     repository: ShoppingRepository,
     chat_id: int,
+    list_id: int | None,
 ) -> None:
-    items = await repository.list_items(chat_id)
-    text, keyboard = build_list_view(items)
+    if list_id is None:
+        list_id = await repository.latest_list_id(chat_id)
+    items = await repository.list_items(chat_id, list_id)
+    text, keyboard = build_list_view(items, list_id)
     try:
         await query.edit_message_text(text, reply_markup=keyboard)
     except BadRequest as error:
@@ -319,6 +403,8 @@ async def _add_item(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     name: str,
+    list_id: int | None = None,
+    list_message_id: int | None = None,
 ) -> None:
     repository = _repository(context)
     try:
@@ -326,6 +412,7 @@ async def _add_item(
             update.effective_chat.id,
             name,
             update.effective_user.id if update.effective_user else None,
+            list_id,
         )
     except ValueError:
         await update.effective_message.reply_text(
@@ -339,7 +426,18 @@ async def _add_item(
         return
 
     await update.effective_message.reply_text(_add_result_text(result))
-    await _send_list(update, context)
+    if list_message_id is None:
+        await _send_list(update, context, result.item.list_id)
+    else:
+        try:
+            await _edit_list_message(
+                context,
+                update.effective_chat.id,
+                result.item.list_id,
+                list_message_id,
+            )
+        except BadRequest:
+            await _send_list(update, context, result.item.list_id)
 
 
 async def _add_shopping_list(
@@ -354,44 +452,127 @@ async def _add_shopping_list(
         return
 
     repository = _repository(context)
-    created = 0
-    reactivated = 0
-    duplicates = 0
+    valid_names = []
     skipped = 0
-    limit_reached = False
-
     for name in names:
         try:
-            result = await repository.add_item(
-                update.effective_chat.id,
-                name,
-                update.effective_user.id if update.effective_user else None,
-            )
+            valid_names.append(normalize_item_name(name))
         except ValueError:
             skipped += 1
-            continue
-        except ListLimitReachedError:
-            limit_reached = True
-            break
 
-        if result.created:
-            created += 1
-        elif result.reactivated:
-            reactivated += 1
-        else:
-            duplicates += 1
+    if not valid_names:
+        await update.effective_message.reply_text(
+            "В сообщении нет подходящих покупок."
+        )
+        return
 
-    summary = [f"Добавлено: {created}"]
-    if reactivated:
-        summary.append(f"возвращено: {reactivated}")
-    if duplicates:
-        summary.append(f"уже было: {duplicates}")
+    limit_reached = len(valid_names) > repository.max_items_per_list
+    valid_names = valid_names[:repository.max_items_per_list]
+    result = await repository.create_list(
+        update.effective_chat.id,
+        valid_names,
+        update.effective_user.id if update.effective_user else None,
+    )
+    summary = [f"Создан новый список: {len(result.items)} покупок"]
+    if result.duplicate_count:
+        summary.append(f"повторов пропущено: {result.duplicate_count}")
     if skipped:
         summary.append(f"пропущено: {skipped}")
     if limit_reached:
-        summary.append("достигнут лимит списка")
+        summary.append(
+            f"взяты первые {repository.max_items_per_list}"
+        )
     await update.effective_message.reply_text(", ".join(summary) + ".")
-    await _send_list(update, context)
+    await _send_list(update, context, result.list_id)
+
+
+async def _replace_shopping_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    list_id: int,
+    list_message_id: int,
+    text: str,
+) -> None:
+    parsed = parse_shopping_list_message(text)
+    names = parsed if parsed is not None else _parse_item_lines(text)
+    if not names:
+        await update.effective_message.reply_text(
+            "Список не изменён: добавьте хотя бы одну покупку."
+        )
+        return
+
+    repository = _repository(context)
+    valid_names = []
+    skipped = 0
+    for name in names:
+        try:
+            valid_names.append(normalize_item_name(name))
+        except ValueError:
+            skipped += 1
+    if not valid_names:
+        await update.effective_message.reply_text(
+            "Список не изменён: названия покупок некорректны."
+        )
+        return
+
+    limit_reached = len(valid_names) > repository.max_items_per_list
+    valid_names = valid_names[:repository.max_items_per_list]
+    result = await repository.replace_list(
+        update.effective_chat.id,
+        list_id,
+        valid_names,
+        update.effective_user.id if update.effective_user else None,
+    )
+    if result is None:
+        await update.effective_message.reply_text(
+            "Этот список больше не существует."
+        )
+        return
+
+    try:
+        await _edit_list_message(
+            context,
+            update.effective_chat.id,
+            list_id,
+            list_message_id,
+        )
+    except BadRequest as error:
+        if "Message is not modified" not in str(error):
+            logger.info(
+                "Could not edit the original list message; sending a new one",
+                exc_info=True,
+            )
+            await _send_list(update, context, list_id)
+
+    details = [f"Список обновлён: {len(result.items)} покупок"]
+    if result.duplicate_count:
+        details.append(f"повторов пропущено: {result.duplicate_count}")
+    if skipped:
+        details.append(f"пропущено: {skipped}")
+    if limit_reached:
+        details.append(f"взяты первые {repository.max_items_per_list}")
+    await update.effective_message.reply_text(", ".join(details) + ".")
+
+
+async def _edit_list_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    list_id: int,
+    message_id: int,
+) -> None:
+    repository = _repository(context)
+    items = await repository.list_items(chat_id, list_id)
+    text, keyboard = build_list_view(items, list_id)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+    except BadRequest as error:
+        if "Message is not modified" not in str(error):
+            raise
 
 
 def _add_result_text(result: AddItemResult) -> str:
@@ -425,17 +606,42 @@ def _button_name(name: str) -> str:
     return name if len(name) <= 45 else name[:44] + "…"
 
 
+def _is_prompt_reply(update: Update, prompt: dict | None) -> bool:
+    message = update.effective_message
+    return bool(
+        prompt is not None
+        and prompt["chat_id"] == update.effective_chat.id
+        and message.reply_to_message is not None
+        and message.reply_to_message.message_id == prompt["message_id"]
+    )
+
+
+def _parse_list_action(data: str) -> tuple[str, int | None]:
+    action, separator, raw_list_id = data.partition(":")
+    if action not in {"add", "edit", "refresh", "remove_checked"}:
+        return "", None
+    if not separator:
+        return action, None
+    try:
+        return action, int(raw_list_id)
+    except ValueError:
+        return "", None
+
+
+def _parse_item_lines(text: str) -> list[str]:
+    items = []
+    for line in text.splitlines():
+        item = LIST_ITEM_PREFIX.sub("", line, count=1).strip()
+        if item and not SHOPPING_LIST_HEADER_LINE.fullmatch(item):
+            items.append(item)
+    return items
+
+
 def parse_shopping_list_message(text: str) -> list[str] | None:
     match = SHOPPING_LIST_HEADER.match(text)
     if match is None:
         return None
-
-    items = []
-    for line in text[match.end():].splitlines():
-        item = LIST_ITEM_PREFIX.sub("", line, count=1).strip()
-        if item:
-            items.append(item)
-    return items
+    return _parse_item_lines(text[match.end():])
 
 
 async def _heartbeat_loop() -> None:
